@@ -13,10 +13,10 @@ use std::{
 /// WARNING: If version is changed, bindings for all platforms will have to be re-generated.
 ///          To do so, run this:
 ///              cargo build --package onnxruntime-sys --features generate-bindings
-const ORT_VERSION: &str = "1.8.1";
+const ORT_VERSION: &str = "1.11.0";
 
 /// Base Url from which to download pre-built releases/
-const ORT_RELEASE_BASE_URL: &str = "https://github.com/microsoft/onnxruntime/releases/download";
+const ORT_RELEASE_BASE_URL: &str = "https://tabnine-rust-libs.s3.amazonaws.com/onnxruntime";
 
 /// Environment variable selecting which strategy to use for finding the library
 /// Possibilities:
@@ -34,6 +34,8 @@ const ORT_ENV_GPU: &str = "ORT_USE_CUDA";
 /// Subdirectory (of the 'target' directory) into which to extract the prebuilt library.
 const ORT_PREBUILT_EXTRACT_DIR: &str = "onnxruntime";
 
+const API_HEADER_NAME: &str = "onnxruntime_c_api.h";
+
 #[cfg(feature = "disable-sys-build-script")]
 fn main() {
     println!("Build script disabled!");
@@ -50,8 +52,22 @@ fn main() {
     println!("Lib directory: {:?}", lib_dir);
 
     // Tell cargo to tell rustc to link onnxruntime shared library.
-    println!("cargo:rustc-link-lib=onnxruntime");
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
+
+    let target_os = env::var("CARGO_CFG_TARGET_OS").expect("Unable to read target os");
+    if target_os == "windows" {
+        println!("cargo:rustc-link-lib=onnxruntime");
+    } else {
+        println!("cargo:rustc-link-lib=static=onnxruntime");
+
+        if target_os == "linux" {
+            println!("cargo:rustc-link-lib=static=stdc++");
+            println!("cargo:rustc-link-lib=static=gcc");
+        } else { //mac
+            println!("cargo:rustc-link-lib=c++");
+            println!("cargo:rustc-link-lib=c");
+        }
+    }
 
     println!("cargo:rerun-if-env-changed={}", ORT_ENV_STRATEGY);
     println!("cargo:rerun-if-env-changed={}", ORT_ENV_GPU);
@@ -78,17 +94,11 @@ fn generate_bindings(_include_dir: &Path) {
 
 #[cfg(feature = "generate-bindings")]
 fn generate_bindings(include_dir: &Path) {
-    let clang_args = &[
-        format!("-I{}", include_dir.display()),
-        format!(
-            "-I{}",
-            include_dir
-                .join("onnxruntime")
-                .join("core")
-                .join("session")
-                .display()
-        ),
-    ];
+    let api_file = include_dir.join(API_HEADER_NAME);
+    let url = format!("https://raw.githubusercontent.com/microsoft/onnxruntime/v{}/include/onnxruntime/core/session/{}", ORT_VERSION, API_HEADER_NAME);
+    download(&url, api_file);
+
+    let clang_args = &[format!("-I{}", include_dir.display())];
 
     // Tell cargo to invalidate the built crate whenever the wrapper changes
     println!("cargo:rerun-if-changed=wrapper.h");
@@ -138,20 +148,11 @@ where
         .call()
         .unwrap_or_else(|err| panic!("ERROR: Failed to download {}: {:?}", source_url, err));
 
-    let len = resp
-        .header("Content-Length")
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap();
     let mut reader = resp.into_reader();
-    // FIXME: Save directly to the file
-    let mut buffer = vec![];
-    let read_len = reader.read_to_end(&mut buffer).unwrap();
-    assert_eq!(buffer.len(), len);
-    assert_eq!(buffer.len(), read_len);
-
+    fs::create_dir_all(target_file.as_ref().parent().unwrap()).unwrap();
     let f = fs::File::create(&target_file).unwrap();
     let mut writer = io::BufWriter::new(f);
-    writer.write_all(&buffer).unwrap();
+    io::copy(&mut reader, &mut writer).unwrap();
 }
 
 fn extract_archive(filename: &Path, output: &Path) {
@@ -352,7 +353,7 @@ impl OnnxPrebuiltArchive for Triplet {
     }
 }
 
-fn prebuilt_archive_url() -> (PathBuf, String) {
+/*fn prebuilt_archive_url() -> (PathBuf, String) {
     let triplet = Triplet {
         os: env::var("CARGO_CFG_TARGET_OS")
             .expect("Unable to get TARGET_OS")
@@ -377,20 +378,42 @@ fn prebuilt_archive_url() -> (PathBuf, String) {
     );
 
     (PathBuf::from(prebuilt_archive), prebuilt_url)
+}*/
+
+fn prebuilt_archive_url() -> (PathBuf, String) {
+    let target_os = env::var("CARGO_CFG_TARGET_OS").expect("Unable to read target os");
+
+    let library_name = if target_os == "windows" {
+        "onnxruntime.dll"
+    } else {
+        "libonnxruntime.a"
+    };
+
+    let mut target = env::var("TARGET").expect("Unable to read target");
+    if target_os == "windows" {
+        target = target.replace("msvc", "gnu");
+    }
+
+    let url = format!(
+        "{}/v{}/{}/{}",
+        ORT_RELEASE_BASE_URL, ORT_VERSION, target, library_name
+    );
+
+    (PathBuf::from(library_name), url)
 }
 
 fn prepare_libort_dir_prebuilt() -> PathBuf {
     let (prebuilt_archive, prebuilt_url) = prebuilt_archive_url();
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let extract_dir = out_dir.join(ORT_PREBUILT_EXTRACT_DIR);
-    let downloaded_file = out_dir.join(&prebuilt_archive);
+    let download_dir = out_dir.join(ORT_PREBUILT_EXTRACT_DIR);
+    let downloaded_file = download_dir.join("lib").join(&prebuilt_archive);
 
     println!("cargo:rerun-if-changed={}", downloaded_file.display());
 
     if !downloaded_file.exists() {
         println!("Creating directory {:?}", out_dir);
-        fs::create_dir_all(&out_dir).unwrap();
+        fs::create_dir_all(&downloaded_file.parent().unwrap()).unwrap();
 
         println!(
             "Downloading {} into {}",
@@ -400,12 +423,7 @@ fn prepare_libort_dir_prebuilt() -> PathBuf {
         download(&prebuilt_url, &downloaded_file);
     }
 
-    if !extract_dir.exists() {
-        println!("Extracting to {}...", extract_dir.display());
-        extract_archive(&downloaded_file, &extract_dir);
-    }
-
-    extract_dir.join(prebuilt_archive.file_stem().unwrap())
+    download_dir
 }
 
 fn prepare_libort_dir() -> PathBuf {
