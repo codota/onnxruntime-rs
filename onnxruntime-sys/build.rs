@@ -62,7 +62,13 @@ fn main() {
 
         if target_os == "linux" {
             println!("cargo:rustc-link-lib=static=stdc++");
-            println!("cargo:rustc-link-lib=static=gcc");
+
+            if env::var("CARGO_CFG_TARGET_ENV").expect("Unable to get target env") == "gnu" {
+                println!("cargo:rustc-link-lib=static=gcc");
+            } else {
+                println!("cargo:rustc-link-lib=static=c");
+
+            }
         } else { //mac
             println!("cargo:rustc-link-lib=c++");
             println!("cargo:rustc-link-lib=c");
